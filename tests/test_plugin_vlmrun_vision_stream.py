@@ -1,10 +1,10 @@
 from __future__ import annotations
 
 import asyncio
-import base64
 import json
 from collections.abc import Awaitable, Callable
 from typing import Any
+from unittest.mock import MagicMock
 
 import aiohttp
 import pytest
@@ -58,8 +58,8 @@ async def answer(ws: web.WebSocketResponse, event: dict[str, Any]) -> None:
     await ws.send_json(
         {
             "type": "decision",
-            "id": event["id"],
-            "frame": int(event["id"]),
+            "id": None,
+            "frame": event["frame"],
             "answers": answers(0.9),
             "usage": {"input_tokens": 147, "output_tokens": 0, "cost": 0.001},
             "latency_ms": 42.0,
@@ -102,23 +102,31 @@ class FakeGateway:
                 "max_frame_bytes": 2 * 1024 * 1024,
             }
         )
+        # Like the live gateway: binary frames are numbered 1, 2, ... per session, and every
+        # decision, drop and error names that number.
+        received = 0
         async for msg in ws:
+            if msg.type == aiohttp.WSMsgType.BINARY:
+                received += 1
+                frame = {"type": "frame", "frame": received, "data": msg.data}
+                frame["_session"] = session_id
+                self.messages.append(frame)
+                await self.reply(ws, frame)
+                continue
             if msg.type != aiohttp.WSMsgType.TEXT:
                 break
             event = json.loads(msg.data)
             event["_session"] = session_id
             self.messages.append(event)
-            if event["type"] == "decide":
-                await self.reply(ws, event)
-            elif event["type"] == "session.close":
+            if event["type"] == "session.close":
                 await ws.send_json(
                     {"type": "session.stats", "session_id": session_id, "p50_ms": 40.0}
                 )
                 await ws.close()
         return ws
 
-    def decides(self) -> list[dict[str, Any]]:
-        return [m for m in self.messages if m["type"] == "decide"]
+    def frames(self) -> list[dict[str, Any]]:
+        return [m for m in self.messages if m["type"] == "frame"]
 
 
 @pytest.fixture(autouse=True)
@@ -195,6 +203,7 @@ async def test_session_create_carries_questions_and_options(gateway, http):
             },
         },
         "max_inflight": 4,
+        "detail": "low",
         "state": "A lobby camera",
     }
     assert "Authorization" not in gateway.headers[0], "anonymous mode sends no bearer"
@@ -217,10 +226,8 @@ async def test_frame_is_sent_as_image_part_and_decision_is_decoded(gateway, http
     await wait_for(lambda: len(events["decision"]) == 1)
     await stream.aclose()
 
-    part = gateway.decides()[0]["content"][0]
-    assert part["type"] == "image_url"
-    assert part["image_url"]["detail"] == "high"
-    assert part["image_url"]["url"] == "data:image/png;base64," + base64.b64encode(PNG).decode()
+    assert gateway.frames()[0]["data"] == PNG, "frames go as raw binary messages"
+    assert gateway.creates[0]["detail"] == "high"
 
     decision: FrameDecision = events["decision"][0]
     assert decision.frame == index
@@ -245,13 +252,13 @@ async def test_video_frame_is_encoded_as_resized_jpeg(gateway, http):
     await wait_for(lambda: len(events["decision"]) == 1)
     await stream.aclose()
 
-    url = gateway.decides()[0]["content"][0]["image_url"]["url"]
-    assert url.startswith("data:image/jpeg;base64,")
+    data = gateway.frames()[0]["data"]
+    assert data.startswith(b"\xff\xd8\xff"), "video frames are encoded as JPEG"
     import io
 
     from PIL import Image
 
-    image = Image.open(io.BytesIO(base64.b64decode(url.split(",", 1)[1])))
+    image = Image.open(io.BytesIO(data))
     assert image.size == (64, 48)
 
 
@@ -272,7 +279,7 @@ async def test_latest_frame_wins_when_slots_are_busy(http):
         stream = make_stream(gateway, http, max_inflight=1)
         events = collect(stream)
         first = stream.push_frame(JPEG)
-        await wait_for(lambda: len(gateway.decides()) == 1)
+        await wait_for(lambda: len(gateway.frames()) == 1)
         second = stream.push_frame(JPEG)
         third = stream.push_frame(JPEG)
         release.set()
@@ -289,7 +296,9 @@ async def test_latest_frame_wins_when_slots_are_busy(http):
 async def test_server_frame_dropped_is_reported(http):
     async def drop(ws: web.WebSocketResponse, event: dict[str, Any]) -> None:
         # The live gateway's frame.dropped carries its own frame count, not the decide id.
-        await ws.send_json({"type": "frame.dropped", "frame": 0, "inflight": 1, "reason": "busy"})
+        await ws.send_json(
+            {"type": "frame.dropped", "frame": event["frame"], "inflight": 1, "reason": "busy"}
+        )
 
     gateway = FakeGateway(drop)
     await gateway.server.start_server()
@@ -299,7 +308,7 @@ async def test_server_frame_dropped_is_reported(http):
         index = stream.push_frame(JPEG)
         await wait_for(lambda: len(events["frame_dropped"]) == 1)
         stream.push_frame(JPEG)
-        await wait_for(lambda: len(gateway.decides()) == 2)
+        await wait_for(lambda: len(gateway.frames()) == 2)
         await stream.aclose()
     finally:
         await gateway.server.close()
@@ -322,7 +331,7 @@ def error_reply(error_type: str, retry_after: float | None = None) -> Reply:
                     "type": "error",
                     "error_type": error_type,
                     "message": "failed",
-                    "frame": 0,
+                    "frame": event["frame"],
                     "retry_after": retry_after,
                 }
             )
@@ -351,7 +360,7 @@ async def test_rate_limit_error_frees_the_slot_and_waits_retry_after(http):
 
     error: VisionStreamError = events["error"][0]
     assert error.error_type == "rate_limit_error"
-    assert error.frame == first, "an id-less error is matched to the oldest read"
+    assert error.frame == first
     assert error.recoverable
     assert answered_after >= 0.25, f"next read waited for retry_after: {answered_after:.2f}s"
     assert gateway.sessions == 1
@@ -497,7 +506,7 @@ async def test_update_state_is_sent_before_next_read(gateway, http):
     await wait_for(lambda: len(events["decision"]) == 2)
     await stream.aclose()
     kinds = [m["type"] for m in gateway.messages]
-    assert kinds[:3] == ["decide", "state", "decide"]
+    assert kinds[:3] == ["frame", "state", "frame"]
     assert gateway.messages[1]["state"] == "Night shift"
 
 
@@ -533,3 +542,110 @@ def test_rejects_bad_arguments():
         VisionStream(questions=QUESTIONS, max_inflight=9)
     with pytest.raises(ValueError):
         VisionStream(questions=QUESTIONS, fps=0)
+
+
+async def test_out_of_order_replies_are_matched_by_frame_number(http):
+    """The live gateway answers out of order and reports errors at once."""
+    held: dict[int, asyncio.Future[None]] = {}
+
+    async def reply(ws: web.WebSocketResponse, event: dict[str, Any]) -> None:
+        if event["data"] == b"bad":
+            await ws.send_json(
+                {
+                    "type": "error",
+                    "error_type": "invalid_request_error",
+                    "message": "a frame is raw JPEG, PNG, WebP or GIF bytes",
+                    "frame": event["frame"],
+                    "retry_after": None,
+                }
+            )
+        elif event["frame"] == 1:
+
+            async def later() -> None:
+                await held[3]
+                await answer(ws, event)
+
+            held[1] = asyncio.ensure_future(later())
+        else:
+            await answer(ws, event)
+            if event["frame"] == 3:
+                held.setdefault(3, asyncio.get_running_loop().create_future()).set_result(None)
+
+    gateway = FakeGateway(reply)
+    await gateway.server.start_server()
+    try:
+        stream = make_stream(gateway, http, max_inflight=3)
+        events = collect(stream)
+        held[3] = asyncio.get_running_loop().create_future()
+        first = stream.push_frame(JPEG)
+        await wait_for(lambda: len(gateway.frames()) == 1)
+        bad = stream.push_frame(b"bad")
+        await wait_for(lambda: len(gateway.frames()) == 2)
+        third = stream.push_frame(JPEG)
+        await wait_for(lambda: len(events["decision"]) == 2)
+        await stream.aclose()
+    finally:
+        await gateway.server.close()
+
+    assert [d.frame for d in events["decision"]] == [third, first]
+    assert [(e.frame, e.recoverable) for e in events["error"]] == [(bad, True)]
+    assert events["frame_dropped"] == []
+
+
+async def test_error_without_a_frame_keeps_streaming(http):
+    """A rejected state update names no frame; it is reported and reads continue."""
+    calls = 0
+
+    async def reply(ws: web.WebSocketResponse, event: dict[str, Any]) -> None:
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            await ws.send_json(
+                {"type": "error", "error_type": "invalid_request_error", "message": "bad state"}
+            )
+        await answer(ws, event)
+
+    gateway = FakeGateway(reply)
+    await gateway.server.start_server()
+    try:
+        stream = make_stream(gateway, http)
+        events = collect(stream)
+        stream.push_frame(JPEG)
+        await wait_for(lambda: len(events["decision"]) == 1)
+        stream.push_frame(JPEG)
+        await wait_for(lambda: len(events["decision"]) == 2)
+        await stream.aclose()
+    finally:
+        await gateway.server.close()
+
+    assert [(e.frame, e.recoverable) for e in events["error"]] == [(None, True)]
+    assert gateway.sessions == 1
+
+
+async def test_every_followed_track_stream_is_closed(gateway, http, monkeypatch):
+    """Tracks switched within one tick: readers that never ran still close their streams."""
+    closed: list[str] = []
+
+    class FakeVideoStream:
+        def __init__(self, track: Any) -> None:
+            self.sid = track.sid
+
+        def __aiter__(self) -> FakeVideoStream:
+            return self
+
+        async def __anext__(self) -> Any:
+            await asyncio.Event().wait()
+            raise StopAsyncIteration
+
+        async def aclose(self) -> None:
+            closed.append(self.sid)
+
+    monkeypatch.setattr(vs.rtc, "VideoStream", FakeVideoStream)
+    stream = make_stream(gateway, http)
+    for sid in ("a", "b", "c"):
+        track = MagicMock(kind=rtc.TrackKind.KIND_VIDEO, sid=sid)
+        participant = MagicMock(identity="user")
+        stream._participant_identity = "user"
+        stream._on_track_subscribed(track, MagicMock(), participant)
+    await stream.aclose()
+    assert sorted(closed) == ["a", "b", "c"]

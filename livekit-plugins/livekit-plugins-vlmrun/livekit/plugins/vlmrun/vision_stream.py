@@ -15,7 +15,6 @@
 from __future__ import annotations
 
 import asyncio
-import base64
 import contextlib
 import itertools
 import json
@@ -58,6 +57,7 @@ _IDLE_CLOSE_S = 20.0
 _RENEW_MARGIN_S = 15.0
 _MIN_SESSION_S = 5.0
 _CLOSE_TIMEOUT_S = 5.0
+# Fallback when session.created doesn't state max_frame_bytes.
 _MAX_IMAGE_BYTES = 2 * 1024 * 1024
 # Rejections that a reconnect cannot fix.
 _FATAL_ERROR_TYPES = frozenset(
@@ -130,7 +130,12 @@ class _SessionEnd:
 class _Session:
     session_id: str
     slots: asyncio.Semaphore
-    inflight: dict[str, tuple[int, float]] = field(default_factory=dict)
+    max_frame_bytes: int = _MAX_IMAGE_BYTES
+    sent: int = 0
+    """Binary frames sent this session. The gateway numbers them 1, 2, ... in this order
+    and every decision, drop and error names that number."""
+    inflight: dict[int, tuple[int, float]] = field(default_factory=dict)
+    """Gateway frame number -> (our frame index, timestamp)."""
     stats_received: asyncio.Event = field(default_factory=asyncio.Event)
     closing: bool = False
     resume_at: float = 0.0
@@ -225,6 +230,7 @@ class VisionStream(rtc.EventEmitter[EventTypes]):
         self._closed = False
         # Set when the stream stops on its own after a fatal error; aclose() still runs.
         self._stopped = False
+        self._answered = False
         self._main_task: asyncio.Task[None] | None = None
         self._stats: dict[str, Any] = {}
 
@@ -354,12 +360,11 @@ class VisionStream(rtc.EventEmitter[EventTypes]):
         if track.sid == self._track_sid:
             return
 
-        old_task, old_stream = self._reader_task, self._video_stream
+        self._release_reader()
         self._track_sid = track.sid
         self._video_stream = rtc.VideoStream(track)
         self._reader_task = asyncio.create_task(
-            self._read_track(self._video_stream, old_task, old_stream),
-            name="vlmrun.VisionStream.read_track",
+            self._read_track(self._video_stream), name="vlmrun.VisionStream.read_track"
         )
 
     def _on_track_unsubscribed(
@@ -370,28 +375,23 @@ class VisionStream(rtc.EventEmitter[EventTypes]):
     ) -> None:
         if track.sid == self._track_sid:
             self._track_sid = None
-            self._track_task(asyncio.create_task(self._stop_reader()))
+            self._release_reader()
+
+    def _release_reader(self) -> None:
+        # A separate task owns closing the stream: a reader cancelled before it ever ran
+        # skips its own cleanup, which would leak the VideoStream and its frame buffer.
+        task, stream = self._reader_task, self._video_stream
+        self._reader_task, self._video_stream = None, None
+        if task is not None or stream is not None:
+            self._track_task(asyncio.create_task(_close_reader(task, stream)))
 
     async def _stop_reader(self) -> None:
         task, stream = self._reader_task, self._video_stream
         self._reader_task, self._video_stream = None, None
-        if task is not None:
-            await utils.aio.cancel_and_wait(task)
-        if stream is not None:
-            await stream.aclose()
+        await _close_reader(task, stream)
 
     @utils.log_exceptions(logger=logger)
-    async def _read_track(
-        self,
-        stream: rtc.VideoStream,
-        previous_task: asyncio.Task[None] | None,
-        previous_stream: rtc.VideoStream | None,
-    ) -> None:
-        if previous_task is not None:
-            await utils.aio.cancel_and_wait(previous_task)
-        if previous_stream is not None:
-            await previous_stream.aclose()
-
+    async def _read_track(self, stream: rtc.VideoStream) -> None:
         loop = asyncio.get_running_loop()
         interval = 1.0 / self._fps
         next_due = 0.0
@@ -413,18 +413,30 @@ class VisionStream(rtc.EventEmitter[EventTypes]):
                 self._owns_http_session = True
         return self._http_session
 
-    def _encode(self, data: FrameInput) -> str:
+    def _encode(self, data: FrameInput, limit: int) -> bytes:
         if isinstance(data, rtc.VideoFrame):
             raw = encode(data, EncodeOptions(format="JPEG", resize_options=self._resize))
-            mime = "image/jpeg"
         else:
             raw = data
-            mime = _sniff_mime(raw)
-        if len(raw) > _MAX_IMAGE_BYTES:
-            raise ValueError("encoded frame exceeds the gateway's 2 MiB limit")
-        return f"data:{mime};base64,{base64.b64encode(raw).decode()}"
+        if len(raw) > limit:
+            raise ValueError(f"encoded frame exceeds the gateway's {limit} byte limit")
+        return raw
 
     async def _run(self) -> None:
+        try:
+            await self._run_loop()
+        except Exception as e:
+            logger.exception("vlmrun vision stream failed")
+            error = e if isinstance(e, APIError) else APIError(str(e), retryable=False)
+            self._emit_error(error, frame=None, recoverable=False)
+        finally:
+            if not self._closed:
+                self._stopped = True
+            if self._pending is not None:
+                dropped, self._pending = self._pending, None
+                self.emit("frame_dropped", FrameDropped(dropped.frame, dropped.timestamp, "lost"))
+
+    async def _run_loop(self) -> None:
         failures = 0
         while not self._closed:
             if self._pending is None:
@@ -443,12 +455,14 @@ class VisionStream(rtc.EventEmitter[EventTypes]):
                 await asyncio.sleep(self._conn_options._interval_for_retry(failures - 1))
                 continue
 
-            failures = 0
+            self._answered = False
             try:
                 end = await self._run_session(ws, created)
+                failures = 0
                 logger.debug("vlmrun vision session ended", extra={"reason": end.reason})
             except APIError as e:
-                failures += 1
+                # A session that answered frames was healthy; count only back-to-back failures.
+                failures = 1 if self._answered else failures + 1
                 fatal = not e.retryable or failures > self._conn_options.max_retry
                 self._emit_error(e, frame=None, recoverable=not fatal)
                 if fatal:
@@ -456,12 +470,6 @@ class VisionStream(rtc.EventEmitter[EventTypes]):
                 await asyncio.sleep(self._conn_options._interval_for_retry(failures - 1))
             finally:
                 await ws.close()
-
-        if not self._closed:
-            self._stopped = True
-        if self._pending is not None:
-            dropped, self._pending = self._pending, None
-            self.emit("frame_dropped", FrameDropped(dropped.frame, dropped.timestamp, "lost"))
 
     async def _connect(self) -> tuple[aiohttp.ClientWebSocketResponse, dict[str, Any]]:
         session = self._ensure_http_session()
@@ -487,6 +495,7 @@ class VisionStream(rtc.EventEmitter[EventTypes]):
             "model": self._model,
             "questions": self._questions,
             "max_inflight": self._max_inflight,
+            "detail": self._detail,
         }
         if self._state:
             create["state"] = self._state
@@ -502,7 +511,13 @@ class VisionStream(rtc.EventEmitter[EventTypes]):
         if msg.type != aiohttp.WSMsgType.TEXT:
             await ws.close()
             raise _closed_error(ws)
-        created = json.loads(msg.data)
+        try:
+            created = json.loads(msg.data)
+        except json.JSONDecodeError:
+            created = None
+        if not isinstance(created, dict):
+            await ws.close()
+            raise APIError("invalid session reply from the VLM Run gateway", retryable=True)
         if created.get("type") != "session.created":
             await ws.close()
             raise _event_error(created)
@@ -515,6 +530,7 @@ class VisionStream(rtc.EventEmitter[EventTypes]):
         session = _Session(
             session_id=str(created.get("session_id", "")),
             slots=asyncio.Semaphore(max(1, min(self._max_inflight, granted))),
+            max_frame_bytes=int(created.get("max_frame_bytes") or _MAX_IMAGE_BYTES),
         )
         loop = asyncio.get_running_loop()
         expires_in = float(created.get("expires_in") or 300.0)
@@ -577,7 +593,7 @@ class VisionStream(rtc.EventEmitter[EventTypes]):
                 continue
 
             try:
-                url = await asyncio.to_thread(self._encode, pending.data)
+                raw = await asyncio.to_thread(self._encode, pending.data, session.max_frame_bytes)
             except ValueError:
                 session.slots.release()
                 self.emit(
@@ -589,19 +605,9 @@ class VisionStream(rtc.EventEmitter[EventTypes]):
                 self._state_dirty = False
                 await ws.send_str(json.dumps({"type": "state", "state": self._state or ""}))
 
-            request_id = str(pending.frame)
-            session.inflight[request_id] = (pending.frame, pending.timestamp)
-            await ws.send_str(
-                json.dumps(
-                    {
-                        "type": "decide",
-                        "id": request_id,
-                        "content": [
-                            {"type": "image_url", "image_url": {"url": url, "detail": self._detail}}
-                        ],
-                    }
-                )
-            )
+            session.sent += 1
+            session.inflight[session.sent] = (pending.frame, pending.timestamp)
+            await ws.send_bytes(raw)
             last_frame_at = loop.time()
 
     async def _recv_loop(self, ws: aiohttp.ClientWebSocketResponse, session: _Session) -> None:
@@ -630,16 +636,19 @@ class VisionStream(rtc.EventEmitter[EventTypes]):
             try:
                 event = json.loads(msg.data)
             except json.JSONDecodeError:
-                logger.warning("invalid JSON from the VLM Run gateway")
+                event = None
+            if not isinstance(event, dict):
+                logger.warning("invalid message from the VLM Run gateway")
                 continue
             self._handle_event(event, session)
 
     def _handle_event(self, event: dict[str, Any], session: _Session) -> None:
         kind = event.get("type")
         if kind == "decision":
-            entry = self._settle(event.get("id"), session)
+            entry = self._settle(event.get("frame"), session)
             if entry is None:
                 return
+            self._answered = True
             frame, ts = entry
             results, errors = systemone.decode_answers(
                 {name: _coerce_answer(raw) for name, raw in (event.get("answers") or {}).items()}
@@ -656,19 +665,17 @@ class VisionStream(rtc.EventEmitter[EventTypes]):
             self.emit("decision", decision)
             self._publish(decision)
         elif kind == "frame.dropped":
-            entry = self._settle(event.get("id"), session) or self._settle_oldest(session)
-            frame, ts = entry if entry is not None else (int(event.get("frame", -1)), time.time())
-            self.emit("frame_dropped", FrameDropped(frame, ts, "server"))
+            entry = self._settle(event.get("frame"), session)
+            if entry is not None:
+                self.emit("frame_dropped", FrameDropped(entry[0], entry[1], "server"))
         elif kind == "error":
             error = _event_error(event)
             error_type = str(event.get("error_type") or "")
             if error_type in _SESSION_FATAL_ERROR_TYPES:
                 raise error
-            # The gateway doesn't echo the decide id on errors. Reads are answered in
-            # order, so the error belongs to the oldest read in flight.
-            entry = self._settle(event.get("id"), session) or self._settle_oldest(session)
-            if entry is None and not error.retryable:
-                raise error
+            # A frame error names the frame; one without a frame (a rejected state update,
+            # a rate limit) is reported without ending the session.
+            entry = self._settle(event.get("frame"), session)
             if retry_after := event.get("retry_after"):
                 loop = asyncio.get_running_loop()
                 session.resume_at = max(session.resume_at, loop.time() + float(retry_after))
@@ -678,15 +685,10 @@ class VisionStream(rtc.EventEmitter[EventTypes]):
             session.stats_received.set()
             self.emit("session_stats", dict(event))
 
-    def _settle_oldest(self, session: _Session) -> tuple[int, float] | None:
-        if not session.inflight:
+    def _settle(self, gateway_frame: Any, session: _Session) -> tuple[int, float] | None:
+        if not isinstance(gateway_frame, int):
             return None
-        return self._settle(next(iter(session.inflight)), session)
-
-    def _settle(self, request_id: Any, session: _Session) -> tuple[int, float] | None:
-        if request_id is None:
-            return None
-        entry = session.inflight.pop(str(request_id), None)
+        entry = session.inflight.pop(gateway_frame, None)
         if entry is not None:
             session.slots.release()
         return entry
@@ -744,6 +746,13 @@ class VisionStream(rtc.EventEmitter[EventTypes]):
         )
 
 
+async def _close_reader(task: asyncio.Task[None] | None, stream: rtc.VideoStream | None) -> None:
+    if task is not None:
+        await utils.aio.cancel_and_wait(task)
+    if stream is not None:
+        await stream.aclose()
+
+
 def _event_error(event: dict[str, Any]) -> APIStatusError:
     error_type = str(event.get("error_type") or "api_error")
     return APIStatusError(
@@ -777,13 +786,3 @@ def _coerce_answer(answer: Any) -> Any:
                 (int(k) if str(k).lstrip("-").isdigit() else k): v for k, v in value.items()
             }
     return coerced
-
-
-def _sniff_mime(data: bytes) -> str:
-    if data.startswith(b"\x89PNG"):
-        return "image/png"
-    if data[:4] == b"RIFF" and data[8:12] == b"WEBP":
-        return "image/webp"
-    if data.startswith((b"GIF87a", b"GIF89a")):
-        return "image/gif"
-    return "image/jpeg"

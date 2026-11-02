@@ -56,18 +56,26 @@ class CameraAgent(Agent):
                     self._watch(publication.track)
                     break
 
-        @room.on("track_subscribed")
-        def _on_track_subscribed(
-            track: rtc.Track,
-            publication: rtc.RemoteTrackPublication,
-            participant: rtc.RemoteParticipant,
-        ) -> None:
-            if track.kind == rtc.TrackKind.KIND_VIDEO:
-                self._watch(track)
+        room.on("track_subscribed", self._on_track_subscribed)
 
         self.session.generate_reply(
             instructions="Greet the user and offer to describe what you see."
         )
+
+    async def on_exit(self) -> None:
+        get_job_context().room.off("track_subscribed", self._on_track_subscribed)
+        if self._video_stream is not None:
+            await self._video_stream.aclose()
+            self._video_stream = None
+
+    def _on_track_subscribed(
+        self,
+        track: rtc.Track,
+        publication: rtc.RemoteTrackPublication,
+        participant: rtc.RemoteParticipant,
+    ) -> None:
+        if track.kind == rtc.TrackKind.KIND_VIDEO:
+            self._watch(track)
 
     async def on_user_turn_completed(
         self, turn_ctx: llm.ChatContext, new_message: llm.ChatMessage

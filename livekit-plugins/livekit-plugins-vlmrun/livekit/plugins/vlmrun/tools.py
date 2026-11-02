@@ -549,6 +549,8 @@ class _LatestVideoFrame:
         self._room = room
         self._frame: rtc.VideoFrame | None = None
         self._task: asyncio.Task[None] | None = None
+        self._stream: rtc.VideoStream | None = None
+        self._closing: set[asyncio.Task[None]] = set()
         self._track_sid: str | None = None
         for participant in room.remote_participants.values():
             for publication in participant.track_publications.values():
@@ -582,29 +584,38 @@ class _LatestVideoFrame:
     def _follow(self, track: rtc.Track) -> None:
         self._stop()
         self._track_sid = track.sid
-        self._task = asyncio.create_task(self._read(rtc.VideoStream(track)))
+        self._stream = rtc.VideoStream(track)
+        self._task = asyncio.create_task(self._read(self._stream))
 
     def _stop(self) -> None:
-        # the cancelled reader closes its own stream, so the sync event handler never awaits
-        if self._task is not None:
-            self._task.cancel()
-            self._task = None
+        # A separate task owns closing the stream: a reader cancelled before it ever ran
+        # skips its own cleanup, which would leak the VideoStream and its frame buffer.
+        task, stream = self._task, self._stream
+        self._task, self._stream = None, None
+        if task is not None or stream is not None:
+            closer = asyncio.create_task(_close_reader(task, stream))
+            self._closing.add(closer)
+            closer.add_done_callback(self._closing.discard)
         self._track_sid = None
         self._frame = None
 
     async def _read(self, stream: rtc.VideoStream) -> None:
-        try:
-            async for event in stream:
-                self._frame = event.frame
-        finally:
-            await stream.aclose()
+        async for event in stream:
+            self._frame = event.frame
 
     async def aclose(self) -> None:
         self._room.off("track_subscribed", self._on_track_subscribed)
         self._room.off("track_unsubscribed", self._on_track_unsubscribed)
-        if self._task is not None:
-            await utils.aio.cancel_and_wait(self._task)
-            self._task = None
+        self._stop()
+        if self._closing:
+            await asyncio.gather(*self._closing, return_exceptions=True)
+
+
+async def _close_reader(task: asyncio.Task[None] | None, stream: rtc.VideoStream | None) -> None:
+    if task is not None:
+        await utils.aio.cancel_and_wait(task)
+    if stream is not None:
+        await stream.aclose()
 
 
 async def _complete(
@@ -673,10 +684,13 @@ async def _complete_once(
             timeout=aiohttp.ClientTimeout(total=conn_options.timeout),
         ) as resp:
             if resp.status >= 400:
+                # The body stays out of the message: gateway validation errors echo the
+                # request's inputs, which then land in logs.
                 raise APIStatusError(
-                    f"VLM Run {model} request failed: {await resp.text()}",
+                    f"VLM Run {model} request failed",
                     status_code=resp.status,
                     request_id=resp.headers.get("x-request-id"),
+                    body=await resp.text(),
                 )
             data = await resp.json()
     except asyncio.TimeoutError as e:

@@ -20,6 +20,7 @@ live video decisions over WebSocket, and vision tools.
 
 from .decision_model import DecisionModel
 from .llm import LLM
+from .models import ChatModels
 from .tools import (
     HAND_POSE_MODEL,
     BoundingBox,
@@ -38,6 +39,7 @@ from .vision_stream import FrameDecision, FrameDropped, VisionStream, VisionStre
 
 __all__ = [
     "LLM",
+    "ChatModels",
     "DecisionModel",
     "VisionStream",
     "FrameDecision",

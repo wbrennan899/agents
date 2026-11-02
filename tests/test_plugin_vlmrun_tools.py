@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import base64
 import json
 from typing import Any
@@ -404,3 +405,70 @@ async def test_vision_tools_model_overrides():
     await vt.detect_poses()
 
     assert sent_body(session)["model"] == tools.HAND_POSE_MODEL
+
+
+class _FakeVideoStream:
+    instances: list[_FakeVideoStream] = []
+
+    def __init__(self, track: Any) -> None:
+        self.track = track
+        self.closed = False
+        _FakeVideoStream.instances.append(self)
+
+    def __aiter__(self) -> _FakeVideoStream:
+        return self
+
+    async def __anext__(self) -> Any:
+        await asyncio.Event().wait()
+        raise StopAsyncIteration
+
+    async def aclose(self) -> None:
+        self.closed = True
+
+
+class _FakeRoom:
+    def __init__(self) -> None:
+        self.remote_participants: dict[str, Any] = {}
+        self.handlers: dict[str, Any] = {}
+
+    def on(self, event: str, handler: Any) -> None:
+        self.handlers[event] = handler
+
+    def off(self, event: str, handler: Any) -> None:
+        self.handlers.pop(event, None)
+
+
+def _video_track(sid: str) -> Any:
+    track = MagicMock()
+    track.kind = tools.rtc.TrackKind.KIND_VIDEO
+    track.sid = sid
+    return track
+
+
+async def test_every_followed_stream_is_closed(monkeypatch):
+    """Two tracks subscribed in one tick: the first reader never runs, its stream still closes."""
+    _FakeVideoStream.instances = []
+    monkeypatch.setattr(tools.rtc, "VideoStream", _FakeVideoStream)
+    room = _FakeRoom()
+    latest = tools._LatestVideoFrame(room)  # type: ignore[arg-type]  # fake room for the handler API
+    room.handlers["track_subscribed"](_video_track("camera"), MagicMock(), MagicMock())
+    room.handlers["track_subscribed"](_video_track("screen"), MagicMock(), MagicMock())
+    await latest.aclose()
+
+    assert [s.track.sid for s in _FakeVideoStream.instances] == ["camera", "screen"]
+    assert all(s.closed for s in _FakeVideoStream.instances)
+    assert room.handlers == {}
+
+
+async def test_unsubscribed_track_clears_the_frame(monkeypatch):
+    _FakeVideoStream.instances = []
+    monkeypatch.setattr(tools.rtc, "VideoStream", _FakeVideoStream)
+    room = _FakeRoom()
+    latest = tools._LatestVideoFrame(room)  # type: ignore[arg-type]  # fake room for the handler API
+    track = _video_track("camera")
+    room.handlers["track_subscribed"](track, MagicMock(), MagicMock())
+    latest._frame = MagicMock()
+    room.handlers["track_unsubscribed"](track, MagicMock(), MagicMock())
+    assert latest.get() is None, "no answers about a camera that is gone"
+    await latest.aclose()
+    assert _FakeVideoStream.instances[0].closed
