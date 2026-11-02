@@ -525,7 +525,7 @@ class VisionTools(Toolset):
         return result.text or "No text found."
 
     async def _run(self, fn: Callable[..., Any], *args: Any, **kwargs: Any) -> Any:
-        image = self._current_image()
+        image = await self._current_image()
         try:
             return await fn(image, *args, **kwargs, **self._opts)
         except APIStatusError as e:
@@ -533,12 +533,12 @@ class VisionTools(Toolset):
         except APIError as e:
             raise ToolError(f"vision model request failed: {e.message}") from e
 
-    def _current_image(self) -> ImageInput:
+    async def _current_image(self) -> ImageInput:
         frame = self._frame_source() if self._frame_source else None
         if frame is None:
-            raise ToolError("no camera frame is available yet")
+            raise ToolError("no camera frame is available")
         if isinstance(frame, rtc.VideoFrame):
-            return _encode_frame(frame, self._max_side)
+            return await asyncio.to_thread(_encode_frame, frame, self._max_side)
         return frame
 
 
@@ -549,11 +549,13 @@ class _LatestVideoFrame:
         self._room = room
         self._frame: rtc.VideoFrame | None = None
         self._task: asyncio.Task[None] | None = None
+        self._track_sid: str | None = None
         for participant in room.remote_participants.values():
             for publication in participant.track_publications.values():
                 if publication.track is not None and publication.kind == rtc.TrackKind.KIND_VIDEO:
                     self._follow(publication.track)
         room.on("track_subscribed", self._on_track_subscribed)
+        room.on("track_unsubscribed", self._on_track_unsubscribed)
 
     def get(self) -> rtc.VideoFrame | None:
         return self._frame
@@ -567,11 +569,28 @@ class _LatestVideoFrame:
         if track.kind == rtc.TrackKind.KIND_VIDEO:
             self._follow(track)
 
+    def _on_track_unsubscribed(
+        self,
+        track: rtc.Track,
+        publication: rtc.RemoteTrackPublication,
+        participant: rtc.RemoteParticipant,
+    ) -> None:
+        # Without this, tools would keep answering about the last frame after the camera stops.
+        if track.sid == self._track_sid:
+            self._stop()
+
     def _follow(self, track: rtc.Track) -> None:
+        self._stop()
+        self._track_sid = track.sid
+        self._task = asyncio.create_task(self._read(rtc.VideoStream(track)))
+
+    def _stop(self) -> None:
         # the cancelled reader closes its own stream, so the sync event handler never awaits
         if self._task is not None:
             self._task.cancel()
-        self._task = asyncio.create_task(self._read(rtc.VideoStream(track)))
+            self._task = None
+        self._track_sid = None
+        self._frame = None
 
     async def _read(self, stream: rtc.VideoStream) -> None:
         try:
@@ -582,6 +601,7 @@ class _LatestVideoFrame:
 
     async def aclose(self) -> None:
         self._room.off("track_subscribed", self._on_track_subscribed)
+        self._room.off("track_unsubscribed", self._on_track_unsubscribed)
         if self._task is not None:
             await utils.aio.cancel_and_wait(self._task)
             self._task = None

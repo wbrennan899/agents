@@ -73,9 +73,19 @@ async def test_detect_open_vocabulary_finds_red_circle():
     assert box.x < 0.2 and box.y < 0.25 and box.x + box.w < 0.5
 
 
-async def test_detect_fixed_classes_returns_boxes():
-    result = await _call(tools.detect, _shapes())
+async def _person_photo() -> bytes:
+    # The host serves this photo as application/octet-stream, which the gateway rejects as a
+    # URL, so it is sent as bytes.
+    async with aiohttp.ClientSession() as session, session.get(PERSON_IMAGE) as resp:
+        resp.raise_for_status()
+        return await resp.read()
 
+
+async def test_detect_fixed_classes_returns_boxes():
+    result = await _call(tools.detect, await _person_photo())
+
+    assert result.items, "bus.jpg shows a bus and people"
+    assert any(i.label for i in result.items)
     assert all(0 <= i.box.x <= 1 and 0 <= i.box.y <= 1 for i in result.items)
 
 
@@ -87,12 +97,7 @@ async def test_segment_returns_png_label_map():
 
 
 async def test_pose_finds_people():
-    # The host serves this photo as application/octet-stream, which the gateway rejects as a
-    # URL, so it is sent as bytes.
-    async with aiohttp.ClientSession() as session, session.get(PERSON_IMAGE) as resp:
-        resp.raise_for_status()
-        image = await resp.read()
-    result = await _call(tools.pose, image)
+    result = await _call(tools.pose, await _person_photo())
 
     assert result.items, "bus.jpg shows several people"
     person = result.items[0]

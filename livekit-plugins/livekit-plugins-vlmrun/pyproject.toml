@@ -19,7 +19,13 @@ classifiers = [
     "Programming Language :: Python :: 3.10",
     "Programming Language :: Python :: 3 :: Only",
 ]
-dependencies = ["livekit-agents[openai]>=1.8.10", "aiohttp>=3.9"]
+dependencies = [
+    "livekit-agents[openai]>=1.8.10",
+    "aiohttp>=3.9",
+    # llm.py builds requests with the openai SDK directly; SDK 3.x uses httpx2.
+    "openai>=3.19,<4",
+    "httpx2>=2.12,<3",
+]
 
 [project.urls]
 Documentation = "https://docs.livekit.io"

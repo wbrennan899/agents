@@ -3969,13 +3969,17 @@ name = "livekit-plugins-vlmrun"
 source = { editable = "livekit-plugins/livekit-plugins-vlmrun" }
 dependencies = [
     { name = "aiohttp" },
+    { name = "httpx2" },
     { name = "livekit-agents", extra = ["openai"] },
+    { name = "openai" },
 ]
 
 [package.metadata]
 requires-dist = [
     { name = "aiohttp", specifier = ">=3.9" },
+    { name = "httpx2", specifier = ">=2.12,<3" },
     { name = "livekit-agents", extras = ["openai"], editable = "livekit-agents" },
+    { name = "openai", specifier = ">=3.19,<4" },
 ]
 
 [[package]]

@@ -63,6 +63,8 @@ _MAX_IMAGE_BYTES = 2 * 1024 * 1024
 _FATAL_ERROR_TYPES = frozenset(
     {"authentication_error", "permission_error", "invalid_request_error", "not_found_error"}
 )
+# An invalid frame is that frame's problem; only these end the session no matter what.
+_SESSION_FATAL_ERROR_TYPES = frozenset({"authentication_error", "permission_error"})
 
 
 @dataclass
@@ -131,6 +133,8 @@ class _Session:
     inflight: dict[str, tuple[int, float]] = field(default_factory=dict)
     stats_received: asyncio.Event = field(default_factory=asyncio.Event)
     closing: bool = False
+    resume_at: float = 0.0
+    """Loop time before which no read is sent, set by a rate limit's ``retry_after``."""
 
 
 class VisionStream(rtc.EventEmitter[EventTypes]):
@@ -219,6 +223,8 @@ class VisionStream(rtc.EventEmitter[EventTypes]):
         self._pending: _Pending | None = None
         self._frame_ready = asyncio.Event()
         self._closed = False
+        # Set when the stream stops on its own after a fatal error; aclose() still runs.
+        self._stopped = False
         self._main_task: asyncio.Task[None] | None = None
         self._stats: dict[str, Any] = {}
 
@@ -284,6 +290,8 @@ class VisionStream(rtc.EventEmitter[EventTypes]):
         """
         if self._closed:
             raise RuntimeError("VisionStream is closed")
+        if self._stopped:
+            raise RuntimeError("VisionStream stopped after a fatal error")
 
         index = next(self._seq)
         previous = self._pending
@@ -389,7 +397,9 @@ class VisionStream(rtc.EventEmitter[EventTypes]):
         next_due = 0.0
         async for event in stream:
             now = loop.time()
-            if now < next_due or self._closed:
+            if self._closed or self._stopped:
+                return
+            if now < next_due:
                 continue
             next_due = now + interval
             self.push_frame(event.frame)
@@ -443,16 +453,12 @@ class VisionStream(rtc.EventEmitter[EventTypes]):
                 self._emit_error(e, frame=None, recoverable=not fatal)
                 if fatal:
                     break
-                retry_after = e.body.get("retry_after") if isinstance(e.body, dict) else None
-                await asyncio.sleep(
-                    float(retry_after)
-                    if retry_after
-                    else self._conn_options._interval_for_retry(failures - 1)
-                )
+                await asyncio.sleep(self._conn_options._interval_for_retry(failures - 1))
             finally:
                 await ws.close()
 
-        self._closed = True
+        if not self._closed:
+            self._stopped = True
         if self._pending is not None:
             dropped, self._pending = self._pending, None
             self.emit("frame_dropped", FrameDropped(dropped.frame, dropped.timestamp, "lost"))
@@ -548,6 +554,11 @@ class VisionStream(rtc.EventEmitter[EventTypes]):
                 return _SessionEnd("renew")
             if now >= last_frame_at + _IDLE_CLOSE_S and self._pending is None:
                 return _SessionEnd("idle")
+
+            if now < session.resume_at:
+                # Rate limited: keep only the newest frame until the gateway's retry_after.
+                await asyncio.sleep(min(session.resume_at - now, 0.25))
+                continue
 
             if self._pending is None:
                 self._frame_ready.clear()
@@ -645,19 +656,32 @@ class VisionStream(rtc.EventEmitter[EventTypes]):
             self.emit("decision", decision)
             self._publish(decision)
         elif kind == "frame.dropped":
-            entry = self._settle(event.get("id"), session)
+            entry = self._settle(event.get("id"), session) or self._settle_oldest(session)
             frame, ts = entry if entry is not None else (int(event.get("frame", -1)), time.time())
             self.emit("frame_dropped", FrameDropped(frame, ts, "server"))
         elif kind == "error":
-            entry = self._settle(event.get("id"), session)
             error = _event_error(event)
-            if not error.retryable:
+            error_type = str(event.get("error_type") or "")
+            if error_type in _SESSION_FATAL_ERROR_TYPES:
                 raise error
+            # The gateway doesn't echo the decide id on errors. Reads are answered in
+            # order, so the error belongs to the oldest read in flight.
+            entry = self._settle(event.get("id"), session) or self._settle_oldest(session)
+            if entry is None and not error.retryable:
+                raise error
+            if retry_after := event.get("retry_after"):
+                loop = asyncio.get_running_loop()
+                session.resume_at = max(session.resume_at, loop.time() + float(retry_after))
             self._emit_error(error, frame=entry[0] if entry else None, recoverable=True)
         elif kind == "session.stats":
             self._stats = event
             session.stats_received.set()
             self.emit("session_stats", dict(event))
+
+    def _settle_oldest(self, session: _Session) -> tuple[int, float] | None:
+        if not session.inflight:
+            return None
+        return self._settle(next(iter(session.inflight)), session)
 
     def _settle(self, request_id: Any, session: _Session) -> tuple[int, float] | None:
         if request_id is None:

@@ -288,12 +288,13 @@ async def test_latest_frame_wins_when_slots_are_busy(http):
 
 async def test_server_frame_dropped_is_reported(http):
     async def drop(ws: web.WebSocketResponse, event: dict[str, Any]) -> None:
-        await ws.send_json({"type": "frame.dropped", "id": event["id"], "inflight": 2})
+        # The live gateway's frame.dropped carries its own frame count, not the decide id.
+        await ws.send_json({"type": "frame.dropped", "frame": 0, "inflight": 1, "reason": "busy"})
 
     gateway = FakeGateway(drop)
     await gateway.server.start_server()
     try:
-        stream = make_stream(gateway, http)
+        stream = make_stream(gateway, http, max_inflight=1)
         events = collect(stream)
         index = stream.push_frame(JPEG)
         await wait_for(lambda: len(events["frame_dropped"]) == 1)
@@ -308,42 +309,92 @@ async def test_server_frame_dropped_is_reported(http):
     assert gateway.sessions == 1, "a dropped frame frees its slot without a reconnect"
 
 
-async def test_recoverable_error_keeps_streaming(http):
+def error_reply(error_type: str, retry_after: float | None = None) -> Reply:
+    """Fails the first read, then answers. Errors match the live gateway: no decide id."""
     calls = 0
 
-    async def flaky(ws: web.WebSocketResponse, event: dict[str, Any]) -> None:
+    async def reply(ws: web.WebSocketResponse, event: dict[str, Any]) -> None:
         nonlocal calls
         calls += 1
         if calls == 1:
             await ws.send_json(
                 {
                     "type": "error",
-                    "id": event["id"],
-                    "error_type": "rate_limit_error",
-                    "message": "image budget",
-                    "retry_after": 1,
+                    "error_type": error_type,
+                    "message": "failed",
+                    "frame": 0,
+                    "retry_after": retry_after,
                 }
             )
         else:
             await answer(ws, event)
 
-    gateway = FakeGateway(flaky)
+    return reply
+
+
+async def test_rate_limit_error_frees_the_slot_and_waits_retry_after(http):
+    gateway = FakeGateway(error_reply("rate_limit_error", retry_after=0.3))
     await gateway.server.start_server()
+    loop = asyncio.get_running_loop()
     try:
-        stream = make_stream(gateway, http)
+        stream = make_stream(gateway, http, max_inflight=1)
         events = collect(stream)
         first = stream.push_frame(JPEG)
         await wait_for(lambda: len(events["error"]) == 1)
+        errored_at = loop.time()
         stream.push_frame(JPEG)
         await wait_for(lambda: len(events["decision"]) == 1)
+        answered_after = loop.time() - errored_at
         await stream.aclose()
     finally:
         await gateway.server.close()
 
     error: VisionStreamError = events["error"][0]
     assert error.error_type == "rate_limit_error"
-    assert error.frame == first
+    assert error.frame == first, "an id-less error is matched to the oldest read"
     assert error.recoverable
+    assert answered_after >= 0.25, f"next read waited for retry_after: {answered_after:.2f}s"
+    assert gateway.sessions == 1
+
+
+async def test_invalid_frame_is_reported_and_streaming_continues(http):
+    gateway = FakeGateway(error_reply("invalid_request_error"))
+    await gateway.server.start_server()
+    try:
+        stream = make_stream(gateway, http, max_inflight=1)
+        events = collect(stream)
+        bad = stream.push_frame(b"not an image")
+        await wait_for(lambda: len(events["error"]) == 1)
+        good = stream.push_frame(JPEG)
+        await wait_for(lambda: len(events["decision"]) == 1)
+        await stream.aclose()
+    finally:
+        await gateway.server.close()
+
+    assert events["error"][0].frame == bad
+    assert events["error"][0].recoverable
+    assert events["decision"][0].frame == good
+    assert gateway.sessions == 1, "one bad frame doesn't end the session"
+
+
+async def test_aclose_after_fatal_error_releases_owned_session():
+    gateway = FakeGateway(error_reply("authentication_error"))
+    await gateway.server.start_server()
+    try:
+        stream = VisionStream(
+            questions=QUESTIONS,
+            base_url=gateway.base_url,
+            conn_options=APIConnectOptions(max_retry=0, retry_interval=0.05, timeout=2.0),
+        )
+        events = collect(stream)
+        stream.push_frame(JPEG)
+        await wait_for(lambda: any(not e.recoverable for e in events["error"]))
+        owned = stream._http_session
+        await stream.aclose()
+    finally:
+        await gateway.server.close()
+
+    assert owned is not None and owned.closed, "aclose() still cleans up after the stream stopped"
 
 
 async def test_fatal_error_stops_the_stream(http):
