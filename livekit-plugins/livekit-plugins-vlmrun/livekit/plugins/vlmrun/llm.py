@@ -20,7 +20,7 @@ import httpx2 as httpx
 import openai
 from openai._models import FinalRequestOptions
 
-from livekit.agents.llm import ChatContext, Tool, ToolChoice
+from livekit.agents.llm import ChatContext, ChatItem, ChatMessage, Tool, ToolChoice
 from livekit.agents.types import (
     DEFAULT_API_CONNECT_OPTIONS,
     NOT_GIVEN,
@@ -160,14 +160,8 @@ class LLM(OpenAILLM):
         response_format: NotGivenOr[Any] = NOT_GIVEN,
         extra_kwargs: NotGivenOr[dict[str, Any]] = NOT_GIVEN,
     ) -> LLMStream:
-        # The gateway rejects a request without a user message ("No user query found in
-        # messages"), which is what generate_reply(instructions=...) sends for a greeting.
-        # Same placeholder the anthropic, aws and mistralai formats insert.
-        if not any(item.type == "message" and item.role == "user" for item in chat_ctx.items):
-            chat_ctx = chat_ctx.copy()
-            chat_ctx.add_message(role="user", content="(empty)")
         return super().chat(
-            chat_ctx=chat_ctx,
+            chat_ctx=_gateway_chat_ctx(chat_ctx),
             tools=tools,
             conn_options=conn_options,
             parallel_tool_calls=parallel_tool_calls,
@@ -186,3 +180,31 @@ def _check_sampling(
     for name, value in (("temperature", temperature), ("top_p", top_p)):
         if is_given(value) and name not in supported:
             raise ValueError(f"VLM Run model {model!r} does not accept {name!r}")
+
+
+def _gateway_chat_ctx(chat_ctx: ChatContext) -> ChatContext:
+    """Shape a conversation the way the gateway's chat models accept it.
+
+    The gateway rejects a system message anywhere but first ("System message must be at
+    the beginning") and a request with no user message ("No user query found in
+    messages"). generate_reply(instructions=...) produces both: a second system message
+    after the history, and on an opening greeting no user turn at all. System and
+    developer messages are merged into one leading system message, as the anthropic, aws
+    and google formats do, and "(empty)" is added as the user turn when there is none, as
+    the anthropic, aws and mistralai formats do.
+    """
+    system_texts: list[str] = []
+    rest: list[ChatItem] = []
+    for item in chat_ctx.items:
+        if item.type == "message" and item.role in ("system", "developer"):
+            if text := item.raw_text_content:
+                system_texts.append(text)
+            continue
+        rest.append(item)
+
+    shaped = ChatContext(rest)
+    if system_texts:
+        shaped.items.insert(0, ChatMessage(role="system", content=["\n\n".join(system_texts)]))
+    if not any(item.type == "message" and item.role == "user" for item in rest):
+        shaped.add_message(role="user", content="(empty)")
+    return shaped

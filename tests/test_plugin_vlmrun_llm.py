@@ -167,3 +167,14 @@ async def test_existing_user_message_is_left_alone(transport: _Transport) -> Non
     chat_ctx.add_message(role="user", content="hi")
     messages = await _messages_sent(transport, chat_ctx)
     assert [m["role"] for m in messages] == ["system", "user"]
+
+
+async def test_later_system_messages_merge_into_the_first(transport: _Transport) -> None:
+    chat_ctx = llm.ChatContext()
+    chat_ctx.add_message(role="system", content="You can see the camera.")
+    chat_ctx.add_message(role="user", content="hi")
+    chat_ctx.add_message(role="assistant", content="hello")
+    chat_ctx.add_message(role="system", content="Offer to describe the view.")
+    messages = await _messages_sent(transport, chat_ctx)
+    assert [m["role"] for m in messages] == ["system", "user", "assistant"]
+    assert messages[0]["content"] == "You can see the camera.\n\nOffer to describe the view."
