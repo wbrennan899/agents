@@ -34,12 +34,15 @@ from .tools import (
     segment,
 )
 from .version import __version__
-from .vision_stream import VisionStream
+from .vision_stream import FrameDecision, FrameDropped, VisionStream, VisionStreamError
 
 __all__ = [
     "LLM",
     "DecisionModel",
     "VisionStream",
+    "FrameDecision",
+    "FrameDropped",
+    "VisionStreamError",
     "VisionTools",
     "BoundingBox",
     "DetectionResult",

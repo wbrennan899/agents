@@ -15,7 +15,6 @@ from dotenv import load_dotenv
 
 from livekit.agents import Agent, AgentServer, AgentSession, JobContext, cli, inference, llm
 from livekit.plugins import vlmrun
-from livekit.plugins.vlmrun.vision_stream import FrameDecision, VisionStreamError
 
 logger = logging.getLogger("vlmrun-watcher")
 
@@ -65,7 +64,7 @@ async def entrypoint(ctx: JobContext) -> None:
     present = False
 
     @watcher.on("decision")
-    def _on_decision(decision: FrameDecision) -> None:
+    def _on_decision(decision: vlmrun.FrameDecision) -> None:
         nonlocal present
         person = decision.values.get("person")
         if not isinstance(person, float):
@@ -82,7 +81,7 @@ async def entrypoint(ctx: JobContext) -> None:
             session.generate_reply(instructions="The person left the frame. Say so briefly.")
 
     @watcher.on("error")
-    def _on_error(error: VisionStreamError) -> None:
+    def _on_error(error: vlmrun.VisionStreamError) -> None:
         logger.warning("vision stream error", extra={"error_type": error.error_type})
 
     ctx.add_shutdown_callback(watcher.aclose)
