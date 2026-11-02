@@ -1,7 +1,7 @@
 """Voice agent that answers questions about what the user's camera sees, using VLM Run.
 
 The agent keeps the latest frame from the user's camera (or screen share) and attaches it to
-each user turn, so the VLM Run model answers with the current view in front of it.
+each reply, spoken or typed, so the VLM Run model answers with the current view in front of it.
 
 Requires VLMRUN_API_KEY for the default model (qwen/qwen3.8-27b). Without a key the gateway's
 anonymous tier serves qwen/qwen3.5-0.8b only.
@@ -13,6 +13,7 @@ Run with:
 
 import asyncio
 import logging
+from collections.abc import AsyncIterable
 
 from dotenv import load_dotenv
 
@@ -21,7 +22,9 @@ from livekit.agents import (
     Agent,
     AgentServer,
     AgentSession,
+    FlushSentinel,
     JobContext,
+    ModelSettings,
     cli,
     get_job_context,
     inference,
@@ -77,16 +80,27 @@ class CameraAgent(Agent):
         if track.kind == rtc.TrackKind.KIND_VIDEO:
             self._watch(track)
 
-    async def on_user_turn_completed(
-        self, turn_ctx: llm.ChatContext, new_message: llm.ChatMessage
-    ) -> None:
+    def llm_node(
+        self,
+        chat_ctx: llm.ChatContext,
+        tools: list[llm.Tool],
+        model_settings: ModelSettings,
+    ) -> AsyncIterable[llm.ChatChunk | str | FlushSentinel]:
+        # Attach the frame here rather than in on_user_turn_completed: typed chat messages
+        # (generate_reply(user_input=...)) skip that hook. Only this request gets the image,
+        # so old frames don't pile up in the conversation history.
         if self._latest_frame is not None:
-            # 768px keeps detail for small text while bounding image tokens per turn.
-            new_message.content.append(
-                llm.ImageContent(
-                    image=self._latest_frame, inference_width=768, inference_height=768
-                )
-            )
+            chat_ctx = chat_ctx.copy()
+            for i in range(len(chat_ctx.items) - 1, -1, -1):
+                item = chat_ctx.items[i]
+                if item.type == "message" and item.role == "user":
+                    # 768px keeps detail for small text while bounding image tokens per turn.
+                    frame = llm.ImageContent(
+                        image=self._latest_frame, inference_width=768, inference_height=768
+                    )
+                    chat_ctx.items[i] = item.model_copy(update={"content": [*item.content, frame]})
+                    break
+        return Agent.default.llm_node(self, chat_ctx, tools, model_settings)
 
     def _watch(self, track: rtc.Track) -> None:
         if self._video_stream is not None:
