@@ -20,10 +20,16 @@ import httpx2 as httpx
 import openai
 from openai._models import FinalRequestOptions
 
-from livekit.agents.llm import ToolChoice
-from livekit.agents.types import NOT_GIVEN, NotGivenOr
+from livekit.agents.llm import ChatContext, Tool, ToolChoice
+from livekit.agents.types import (
+    DEFAULT_API_CONNECT_OPTIONS,
+    NOT_GIVEN,
+    APIConnectOptions,
+    NotGivenOr,
+)
 from livekit.agents.utils import is_given
 from livekit.plugins.openai import LLM as OpenAILLM
+from livekit.plugins.openai.llm import LLMStream
 
 from ._common import client_headers, openai_base_url, resolve_api_key
 from .models import SUPPORTED_SAMPLING, ChatModels
@@ -142,6 +148,33 @@ class LLM(OpenAILLM):
 
         if created_client:
             self._owns_client = True
+
+    def chat(
+        self,
+        *,
+        chat_ctx: ChatContext,
+        tools: list[Tool] | None = None,
+        conn_options: APIConnectOptions = DEFAULT_API_CONNECT_OPTIONS,
+        parallel_tool_calls: NotGivenOr[bool] = NOT_GIVEN,
+        tool_choice: NotGivenOr[ToolChoice] = NOT_GIVEN,
+        response_format: NotGivenOr[Any] = NOT_GIVEN,
+        extra_kwargs: NotGivenOr[dict[str, Any]] = NOT_GIVEN,
+    ) -> LLMStream:
+        # The gateway rejects a request without a user message ("No user query found in
+        # messages"), which is what generate_reply(instructions=...) sends for a greeting.
+        # Same placeholder the anthropic, aws and mistralai formats insert.
+        if not any(item.type == "message" and item.role == "user" for item in chat_ctx.items):
+            chat_ctx = chat_ctx.copy()
+            chat_ctx.add_message(role="user", content="(empty)")
+        return super().chat(
+            chat_ctx=chat_ctx,
+            tools=tools,
+            conn_options=conn_options,
+            parallel_tool_calls=parallel_tool_calls,
+            tool_choice=tool_choice,
+            response_format=response_format,
+            extra_kwargs=extra_kwargs,
+        )
 
 
 def _check_sampling(

@@ -138,3 +138,32 @@ def test_provider_and_model() -> None:
     model = vlmrun.LLM(model="qwen/qwen3.5-0.8b")
     assert model.model == "qwen/qwen3.5-0.8b"
     assert model.provider == "gateway.vlm.run"
+
+
+async def _messages_sent(transport: _Transport, chat_ctx: llm.ChatContext) -> list[dict[str, Any]]:
+    model = vlmrun.LLM(model="qwen/qwen3.5-0.8b")
+    try:
+        async with model.chat(chat_ctx=chat_ctx) as stream:
+            async for _ in stream:
+                pass
+    finally:
+        await model.aclose()
+    return json.loads(transport.requests[-1].content)["messages"]
+
+
+async def test_instructions_only_request_gets_placeholder_user_message(
+    transport: _Transport,
+) -> None:
+    chat_ctx = llm.ChatContext()
+    chat_ctx.add_message(role="system", content="Greet the user.")
+    messages = await _messages_sent(transport, chat_ctx)
+    assert messages[-1] == {"role": "user", "content": "(empty)"}
+    assert len(chat_ctx.items) == 1, "the caller's context is not modified"
+
+
+async def test_existing_user_message_is_left_alone(transport: _Transport) -> None:
+    chat_ctx = llm.ChatContext()
+    chat_ctx.add_message(role="system", content="Be terse.")
+    chat_ctx.add_message(role="user", content="hi")
+    messages = await _messages_sent(transport, chat_ctx)
+    assert [m["role"] for m in messages] == ["system", "user"]
