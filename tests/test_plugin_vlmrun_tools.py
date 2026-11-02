@@ -7,13 +7,18 @@ from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
-from livekit.agents import APIError, APIStatusError
+from livekit.agents import APIConnectOptions, APIError, APIStatusError
 from livekit.agents.llm import ToolError
 from livekit.plugins.vlmrun import tools
 
 pytestmark = pytest.mark.unit
 
 PNG = b"\x89PNG\r\n\x1a\nfake"
+
+
+@pytest.fixture(autouse=True)
+def _no_retry_wait(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(APIConnectOptions, "_interval_for_retry", lambda self, attempt: 0)
 
 
 def completion(content: Any) -> dict[str, Any]:
@@ -276,6 +281,22 @@ async def test_http_error_raises_status_error():
         await tools.detect(PNG, http_session=session)
     assert exc.value.status_code == 403
     assert exc.value.request_id == "req-1"
+
+
+async def test_server_errors_are_retried():
+    failed = session_for({"detail": "ttft_timeout"}, status=504).post.return_value
+    ok = session_for(completion({"content": {"items": []}})).post.return_value
+    session = MagicMock()
+    session.post = MagicMock(side_effect=[failed, ok])
+    await tools.detect(PNG, http_session=session)
+    assert session.post.call_count == 2
+
+
+async def test_client_errors_are_not_retried():
+    session = session_for({"detail": "invalid_media"}, status=400)
+    with pytest.raises(APIStatusError):
+        await tools.detect(PNG, http_session=session)
+    assert session.post.call_count == 1
 
 
 async def test_malformed_response_raises():

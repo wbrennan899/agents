@@ -599,6 +599,38 @@ async def _complete(
     text: str | None = None,
     method_params: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
+    for attempt in range(conn_options.max_retry + 1):
+        try:
+            return await _complete_once(
+                model=model,
+                method=method,
+                image=image,
+                api_key=api_key,
+                base_url=base_url,
+                http_session=http_session,
+                conn_options=conn_options,
+                text=text,
+                method_params=method_params,
+            )
+        except APIError as e:
+            if not e.retryable or attempt == conn_options.max_retry:
+                raise
+            await asyncio.sleep(conn_options._interval_for_retry(attempt))
+    raise RuntimeError("unreachable")
+
+
+async def _complete_once(
+    *,
+    model: str,
+    method: str | None,
+    image: ImageInput,
+    api_key: str | None,
+    base_url: str | None,
+    http_session: aiohttp.ClientSession | None,
+    conn_options: APIConnectOptions,
+    text: str | None = None,
+    method_params: dict[str, Any] | None = None,
+) -> dict[str, Any]:
     content: list[dict[str, Any]] = [{"type": "image_url", "image_url": {"url": _image_url(image)}}]
     if text:
         content.append({"type": "text", "text": text})

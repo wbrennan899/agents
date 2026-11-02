@@ -87,7 +87,12 @@ async def test_segment_returns_png_label_map():
 
 
 async def test_pose_finds_people():
-    result = await _call(tools.pose, PERSON_IMAGE)
+    # The host serves this photo as application/octet-stream, which the gateway rejects as a
+    # URL, so it is sent as bytes.
+    async with aiohttp.ClientSession() as session, session.get(PERSON_IMAGE) as resp:
+        resp.raise_for_status()
+        image = await resp.read()
+    result = await _call(tools.pose, image)
 
     assert result.items, "bus.jpg shows several people"
     person = result.items[0]
