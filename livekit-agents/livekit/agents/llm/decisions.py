@@ -6,7 +6,7 @@ import asyncio
 import copy
 import time
 from abc import ABC, abstractmethod
-from collections.abc import Mapping
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from typing import Annotated, Any, Literal
 
@@ -20,7 +20,7 @@ from ..metrics import DecisionMetrics
 from ..metrics.base import Metadata
 from ..telemetry import gen_ai, trace_types, tracer
 from ..types import DEFAULT_API_CONNECT_OPTIONS, APIConnectOptions
-from .chat_context import ChatContext
+from .chat_context import ChatContext, ImageContent
 
 DecisionKind = Literal["probability", "choice", "score"]
 _Probability = Annotated[float, Field(ge=0, le=1, allow_inf_nan=False)]
@@ -59,6 +59,9 @@ Decision = Probability | Choice | Score
 class DecisionCapabilities:
     decision_kinds: list[DecisionKind]
     """Decision kinds the model can evaluate"""
+    image_input: bool = False
+    """Whether the model reads images. If so, images in user messages and the ``images``
+    argument reach ``_evaluate_images_impl``; otherwise images are left out."""
 
 
 class ProbabilityResult(BaseModel):
@@ -140,6 +143,16 @@ def _kind(decision: Decision) -> DecisionKind:
     return "score"
 
 
+def _user_images(chat_ctx: ChatContext) -> list[ImageContent]:
+    return [
+        content
+        for item in chat_ctx.items
+        if item.type == "message" and item.role == "user"
+        for content in item.content
+        if isinstance(content, ImageContent)
+    ]
+
+
 def _validate_decisions(
     decisions: Mapping[str, Decision], *, capabilities: DecisionCapabilities | None = None
 ) -> None:
@@ -199,7 +212,8 @@ class DecisionModel(ABC, rtc.EventEmitter[Literal["metrics_collected"]]):
     """Provider-neutral batched decisions over a text input or conversation.
 
     A ChatContext is converted to a ``role: text`` transcript, so every provider receives
-    the same text. In ``on_user_turn_completed``, add the new message to the context first.
+    the same text. Models that declare ``image_input`` also receive the images in user
+    messages. In ``on_user_turn_completed``, add the new message to the context first.
     """
 
     def __init__(self, *, capabilities: DecisionCapabilities) -> None:
@@ -230,6 +244,7 @@ class DecisionModel(ABC, rtc.EventEmitter[Literal["metrics_collected"]]):
         input: str | ChatContext,
         decisions: Mapping[str, Decision],
         conn_options: APIConnectOptions = DEFAULT_API_CONNECT_OPTIONS,
+        images: Sequence[ImageContent] | None = None,
     ) -> DecisionResponse:
         """Evaluate a batch of decisions.
 
@@ -238,6 +253,8 @@ class DecisionModel(ABC, rtc.EventEmitter[Literal["metrics_collected"]]):
                 transcript of user and assistant text.
             decisions: Decisions keyed by name.
             conn_options: Retry and per-attempt timeout settings.
+            images: Images to read after any in the conversation's user messages.
+                Requires a model whose capabilities include ``image_input``.
 
         Each requested name appears in either ``results`` or ``errors``. Request failures
         and malformed responses raise.
@@ -253,6 +270,13 @@ class DecisionModel(ABC, rtc.EventEmitter[Literal["metrics_collected"]]):
         definitions = copy.deepcopy(dict(decisions))
         _validate_decisions(definitions, capabilities=self.capabilities)
         text = input if isinstance(input, str) else _format_transcript(input)
+        if images and not self.capabilities.image_input:
+            raise ValueError(f"{self.label} does not accept image input")
+        image_list: list[ImageContent] = []
+        if self.capabilities.image_input:
+            if isinstance(input, ChatContext):
+                image_list = _user_images(input)
+            image_list.extend(images or [])
         if not definitions:
             return DecisionResponse(results={}, model=self.model, provider=self.provider)
 
@@ -260,7 +284,14 @@ class DecisionModel(ABC, rtc.EventEmitter[Literal["metrics_collected"]]):
         for attempt in range(conn_options.max_retry + 1):
             try:
                 response = await asyncio.wait_for(
-                    self._evaluate_impl(
+                    self._evaluate_images_impl(
+                        input=text,
+                        images=image_list,
+                        decisions=definitions,
+                        conn_options=conn_options,
+                    )
+                    if image_list
+                    else self._evaluate_impl(
                         input=text, decisions=definitions, conn_options=conn_options
                     ),
                     timeout=conn_options.timeout,
@@ -313,6 +344,21 @@ class DecisionModel(ABC, rtc.EventEmitter[Literal["metrics_collected"]]):
         decisions: Mapping[str, Decision],
         conn_options: APIConnectOptions,
     ) -> DecisionResponse: ...
+
+    async def _evaluate_images_impl(
+        self,
+        *,
+        input: str,
+        images: Sequence[ImageContent],
+        decisions: Mapping[str, Decision],
+        conn_options: APIConnectOptions,
+    ) -> DecisionResponse:
+        """Evaluate decisions over text and images, oldest image first.
+
+        Called instead of ``_evaluate_impl`` when the model declares ``image_input`` and
+        the request has at least one image.
+        """
+        raise NotImplementedError(f"{self.label} declares image_input but does not read images")
 
     async def aclose(self) -> None:
         """Release resources owned by this model, if any."""

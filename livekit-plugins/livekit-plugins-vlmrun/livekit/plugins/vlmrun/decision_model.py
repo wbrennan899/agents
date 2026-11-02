@@ -16,15 +16,12 @@ from __future__ import annotations
 
 import asyncio
 import base64
-import contextvars
 from collections.abc import Mapping, Sequence
 from typing import Any, Literal
 
 import aiohttp
 
-from livekit import rtc
 from livekit.agents import (
-    DEFAULT_API_CONNECT_OPTIONS,
     APIConnectionError,
     APIError,
     APIStatusError,
@@ -44,23 +41,14 @@ MAX_IMAGES = 8
 """The gateway reads at most 8 images per request."""
 
 ImageDetail = Literal["auto", "low", "high"]
-ImageInput = llm.ImageContent | rtc.VideoFrame | str
-"""An ImageContent, a video frame, or an image URL (``https://`` or ``data:``)."""
-
-# The base class flattens a ChatContext to a text transcript before calling
-# _evaluate_impl, so images collected in evaluate() reach the request through here.
-# Each evaluate() call runs in its own task context, so concurrent calls never share it.
-_pending_images: contextvars.ContextVar[tuple[dict[str, Any], ...]] = contextvars.ContextVar(
-    "vlmrun_decision_images", default=()
-)
 
 
 class DecisionModel(llm.DecisionModel):
     """Typed decisions over text and images, read by a VLM Run gateway model.
 
-    Unlike text-only decision models, images in the conversation are sent too: every
-    ``ImageContent`` in a user message (a URL, data URL, or video frame) goes with the
-    transcript, newest last, up to the gateway's limit of 8.
+    Declares ``image_input``, so every ``ImageContent`` in a user message (a URL, data
+    URL, or video frame) and in ``evaluate(images=...)`` goes with the transcript, oldest
+    first. Only the newest 8 are sent, the gateway's limit.
 
     Args:
         model: A model served on the gateway's System One route.
@@ -84,7 +72,9 @@ class DecisionModel(llm.DecisionModel):
         http_session: aiohttp.ClientSession | None = None,
     ) -> None:
         super().__init__(
-            capabilities=DecisionCapabilities(decision_kinds=["probability", "choice", "score"])
+            capabilities=DecisionCapabilities(
+                decision_kinds=["probability", "choice", "score"], image_input=True
+            )
         )
         self._model = model
         self._api_key = resolve_api_key(api_key)
@@ -100,42 +90,8 @@ class DecisionModel(llm.DecisionModel):
     def provider(self) -> str:
         return "vlmrun"
 
-    async def evaluate(
-        self,
-        *,
-        input: str | llm.ChatContext,
-        decisions: Mapping[str, Decision],
-        conn_options: APIConnectOptions = DEFAULT_API_CONNECT_OPTIONS,
-        images: Sequence[ImageInput] | None = None,
-    ) -> DecisionResponse:
-        """Evaluate a batch of decisions over the input and its images.
-
-        Args:
-            input: Text sent as-is, or a conversation sent as a transcript plus the
-                images in its user messages.
-            decisions: Decisions keyed by name.
-            conn_options: Retry and per-attempt timeout settings.
-            images: Extra images to read, after any from the conversation.
-        """
-        collected: list[ImageInput] = []
-        if isinstance(input, llm.ChatContext):
-            for item in input.items:
-                if item.type == "message" and item.role == "user":
-                    collected.extend(c for c in item.content if isinstance(c, llm.ImageContent))
-        collected.extend(images or [])
-        parts = tuple(self._image_part(image) for image in collected[-MAX_IMAGES:])
-
-        token = _pending_images.set(parts)
-        try:
-            return await super().evaluate(
-                input=input, decisions=decisions, conn_options=conn_options
-            )
-        finally:
-            _pending_images.reset(token)
-
-    def _image_part(self, image: ImageInput) -> dict[str, Any]:
-        content = image if isinstance(image, llm.ImageContent) else llm.ImageContent(image=image)
-        serialized = serialize_image(content)
+    def _image_part(self, image: llm.ImageContent) -> dict[str, Any]:
+        serialized = serialize_image(image)
         if serialized.external_url:
             url = serialized.external_url
         else:
@@ -152,13 +108,25 @@ class DecisionModel(llm.DecisionModel):
         decisions: Mapping[str, Decision],
         conn_options: APIConnectOptions,
     ) -> DecisionResponse:
+        return await self._evaluate_images_impl(
+            input=input, images=(), decisions=decisions, conn_options=conn_options
+        )
+
+    async def _evaluate_images_impl(
+        self,
+        *,
+        input: str,
+        images: Sequence[llm.ImageContent],
+        decisions: Mapping[str, Decision],
+        conn_options: APIConnectOptions,
+    ) -> DecisionResponse:
         payload: dict[str, Any] = {
             "model": self._model,
             "state": input,
             "questions": {name: systemone.encode_question(d) for name, d in decisions.items()},
         }
-        if parts := _pending_images.get():
-            payload["content"] = list(parts)
+        if images:
+            payload["content"] = [self._image_part(image) for image in images[-MAX_IMAGES:]]
 
         session = self._session or utils.http_context.http_session()
         try:

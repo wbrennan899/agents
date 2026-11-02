@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import asyncio
-from collections.abc import Mapping
+from collections.abc import Mapping, Sequence
 
 import pytest
 from pydantic import ValidationError
@@ -346,3 +346,69 @@ def test_transcript_includes_context_events_when_asked() -> None:
         "[agent handoff: booking -> receptionist]\n"
         "assistant: I can offer seven. [interrupted]"
     )
+
+
+class ImageModel(StaticModel):
+    """Declares image_input and records the images each request carried."""
+
+    def __init__(self, *outcomes: DecisionResponse | Exception) -> None:
+        super().__init__(*outcomes)
+        self._capabilities = decisions.DecisionCapabilities(
+            decision_kinds=["probability", "choice", "score"], image_input=True
+        )
+        self.images: list[list[str]] = []
+
+    async def _evaluate_images_impl(
+        self,
+        *,
+        input: str,
+        images: Sequence[ImageContent],
+        decisions: Mapping[str, decisions.Decision],
+        conn_options: APIConnectOptions,
+    ) -> DecisionResponse:
+        self.images.append([str(image.image) for image in images])
+        return await self._evaluate_impl(
+            input=input, decisions=decisions, conn_options=conn_options
+        )
+
+
+def image_context() -> ChatContext:
+    return ChatContext(
+        [
+            ChatMessage(role="system", content=[ImageContent(image="https://x/system.jpg")]),
+            ChatMessage(
+                role="user", content=["Holding it?", ImageContent(image="https://x/a.jpg")]
+            ),
+            ChatMessage(role="assistant", content=[ImageContent(image="https://x/reply.jpg")]),
+            ChatMessage(role="user", content=[ImageContent(image="https://x/b.jpg")]),
+        ]
+    )
+
+
+async def test_image_model_receives_user_images_then_extra_images() -> None:
+    model = ImageModel(DecisionResponse(results=valid_results()))
+    await evaluate(
+        model, input=image_context(), images=[ImageContent(image="https://x/extra.jpg")]
+    )
+    assert model.images == [["https://x/a.jpg", "https://x/b.jpg", "https://x/extra.jpg"]]
+    assert model.requests[0][0] == "user: Holding it?"
+
+
+async def test_image_model_without_images_uses_text_path() -> None:
+    model = ImageModel(DecisionResponse(results=valid_results()))
+    await evaluate(model, input="text only")
+    assert model.images == []
+    assert model.requests[0][0] == "text only"
+
+
+async def test_text_model_ignores_conversation_images() -> None:
+    model = StaticModel(DecisionResponse(results=valid_results()))
+    await evaluate(model, input=image_context())
+    assert model.requests[0][0] == "user: Holding it?"
+
+
+async def test_text_model_rejects_explicit_images() -> None:
+    model = StaticModel(DecisionResponse(results=valid_results()))
+    with pytest.raises(ValueError, match="does not accept image input"):
+        await evaluate(model, images=[ImageContent(image="https://x/a.jpg")])
+    assert model.requests == []
