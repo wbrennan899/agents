@@ -387,9 +387,7 @@ def image_context() -> ChatContext:
 
 async def test_image_model_receives_user_images_then_extra_images() -> None:
     model = ImageModel(DecisionResponse(results=valid_results()))
-    await evaluate(
-        model, input=image_context(), images=[ImageContent(image="https://x/extra.jpg")]
-    )
+    await evaluate(model, input=image_context(), images=[ImageContent(image="https://x/extra.jpg")])
     assert model.images == [["https://x/a.jpg", "https://x/b.jpg", "https://x/extra.jpg"]]
     assert model.requests[0][0] == "user: Holding it?"
 

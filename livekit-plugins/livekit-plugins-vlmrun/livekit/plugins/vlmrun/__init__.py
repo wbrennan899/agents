@@ -20,7 +20,19 @@ live video decisions over WebSocket, and vision tools.
 
 from .decision_model import DecisionModel
 from .llm import LLM
-from .tools import detect, ocr, pose, segment
+from .tools import (
+    HAND_POSE_MODEL,
+    BoundingBox,
+    DetectionResult,
+    OCRResult,
+    PoseResult,
+    SegmentationResult,
+    VisionTools,
+    detect,
+    ocr,
+    pose,
+    segment,
+)
 from .version import __version__
 from .vision_stream import VisionStream
 
@@ -28,6 +40,13 @@ __all__ = [
     "LLM",
     "DecisionModel",
     "VisionStream",
+    "VisionTools",
+    "BoundingBox",
+    "DetectionResult",
+    "SegmentationResult",
+    "PoseResult",
+    "OCRResult",
+    "HAND_POSE_MODEL",
     "detect",
     "segment",
     "pose",

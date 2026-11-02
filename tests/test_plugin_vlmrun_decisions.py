@@ -144,7 +144,9 @@ async def test_conversation_images_are_sent_as_content_parts() -> None:
 async def test_video_frames_are_encoded_as_jpeg() -> None:
     frame = rtc.VideoFrame(4, 4, rtc.VideoBufferType.RGBA, bytes([255, 0, 0, 255] * 16))
     model, http = model_for(response_body(), detail="high")
-    await model.evaluate(input="Is it red?", decisions=QUESTIONS, images=[ImageContent(image=frame)])
+    await model.evaluate(
+        input="Is it red?", decisions=QUESTIONS, images=[ImageContent(image=frame)]
+    )
     (part,) = sent(http)["content"]
     assert part["image_url"]["url"].startswith("data:image/jpeg;base64,")
     assert part["image_url"]["detail"] == "high"
@@ -153,7 +155,9 @@ async def test_video_frames_are_encoded_as_jpeg() -> None:
 async def test_only_the_newest_eight_images_are_sent() -> None:
     urls = [f"https://example.com/{i}.jpg" for i in range(10)]
     model, http = model_for(response_body())
-    await model.evaluate(input="", decisions=QUESTIONS, images=[ImageContent(image=u) for u in urls])
+    await model.evaluate(
+        input="", decisions=QUESTIONS, images=[ImageContent(image=u) for u in urls]
+    )
     assert [p["image_url"]["url"] for p in sent(http)["content"]] == urls[2:]
 
 

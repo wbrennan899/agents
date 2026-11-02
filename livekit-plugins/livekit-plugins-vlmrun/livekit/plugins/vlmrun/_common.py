@@ -22,7 +22,9 @@ DEFAULT_GATEWAY_URL = "https://gateway.vlm.run"
 
 
 def gateway_url(base_url: str | None = None) -> str:
-    return (base_url or os.environ.get("VLMRUN_GATEWAY_BASE_URL") or DEFAULT_GATEWAY_URL).rstrip("/")
+    return (base_url or os.environ.get("VLMRUN_GATEWAY_BASE_URL") or DEFAULT_GATEWAY_URL).rstrip(
+        "/"
+    )
 
 
 def openai_base_url(base_url: str | None = None) -> str:
@@ -35,7 +37,11 @@ def systemone_url(base_url: str | None = None) -> str:
 
 def stream_ws_url(base_url: str | None = None) -> str:
     url = gateway_url(base_url)
-    return "wss://" + url.removeprefix("https://") if url.startswith("https://") else "ws://" + url.removeprefix("http://")
+    if url.startswith("https://"):
+        url = "wss://" + url.removeprefix("https://")
+    elif url.startswith("http://"):
+        url = "ws://" + url.removeprefix("http://")
+    return f"{url}/typesafe/ws"
 
 
 def resolve_api_key(api_key: str | None = None) -> str | None:

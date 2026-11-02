@@ -44,8 +44,6 @@ from .log import logger
 
 DEFAULT_MODEL = "google/diffusiongemma-26b-a4b-it"
 
-_WS_PATH = "/typesafe/ws"
-
 EventTypes = Literal["decision", "frame_dropped", "error", "session_stats"]
 
 FrameInput = rtc.VideoFrame | bytes
@@ -212,8 +210,6 @@ class VisionStream(rtc.EventEmitter[EventTypes]):
         self._publish_topic = publish_topic
         self._api_key = resolve_api_key(api_key)
         self._url = stream_ws_url(base_url)
-        if not self._url.endswith(_WS_PATH):
-            self._url += _WS_PATH
         self._conn_options = conn_options
 
         self._http_session = http_session
