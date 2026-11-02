@@ -1,12 +1,13 @@
 """Live tests for the VLM Run vision tools against the public gateway.
 
-They run anonymously when ``VLMRUN_API_KEY`` is unset. The anonymous tier allows 30
-requests per hour per IP, so a 429 skips instead of failing.
+They need ``VLMRUN_API_KEY``. A 429 (rate limit) or 403 (model needs a paid account)
+skips instead of failing.
 """
 
 from __future__ import annotations
 
 import io
+import os
 
 import aiohttp
 import pytest
@@ -14,7 +15,10 @@ import pytest
 from livekit.agents import APIStatusError
 from livekit.plugins.vlmrun import tools
 
-pytestmark = pytest.mark.plugin("vlmrun")
+pytestmark = [
+    pytest.mark.plugin("vlmrun"),
+    pytest.mark.skipif(not os.environ.get("VLMRUN_API_KEY"), reason="VLMRUN_API_KEY not set"),
+]
 
 PERSON_IMAGE = "https://ultralytics.com/images/bus.jpg"
 
